@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Tuple, Set, Any
 import sys
 import backoff
 from aiohttp import ClientSession, TCPConnector, ClientTimeout
+import argparse
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
@@ -23,15 +24,17 @@ BASE_URL = "https://xn--d1aiaa2aleeao4h.xn--p1ai/"
 class JudgeParser:
     def __init__(
         self, 
-        max_regions=None, 
+        region_start: int = 1,
+        region_end: Optional[int] = None,
         max_court_types_per_region=None, 
         max_courts_per_type=None, 
         max_judges_per_court=None,
-        max_concurrent_tasks: int = 10
+        max_concurrent_tasks: int = 15
     ):
         self.base_url = BASE_URL
         self.session = None
-        self.max_regions = max_regions
+        self.region_start = region_start
+        self.region_end = region_end
         self.max_court_types_per_region = max_court_types_per_region
         self.max_courts_per_type = max_courts_per_type
         self.max_judges_per_court = max_judges_per_court
@@ -165,8 +168,13 @@ class JudgeParser:
         
         logger.info(f"Найдено {len(region_data)} регионов.")
         
-        if self.max_regions and self.max_regions > 0: 
-            return region_data[:self.max_regions]
+        # Применяем диапазон регионов
+        if self.region_start or self.region_end:
+            start_idx = self.region_start - 1 if self.region_start > 0 else 0
+            end_idx = self.region_end if self.region_end else len(region_data)
+            region_data = region_data[start_idx:end_idx]
+            logger.info(f"Выбран диапазон регионов: с {self.region_start} по {end_idx} (всего {len(region_data)})")
+        
         return region_data
 
     async def get_court_types_from_region(self, region_url: str) -> List[Tuple[str, str]]:
@@ -273,97 +281,97 @@ class JudgeParser:
             return False
 
     def _extract_date_of_birth(self, text: str) -> str:
-        """Извлечение даты рождения из текста с улучшенной логикой"""
+        """
+        Извлечение даты рождения из текста.
+        Ищем ТОЛЬКО по четким паттернам в начале текста (первые 300 символов):
+        1. "12 июня 1990 года рождения" или "12.07.1990 года рождения"
+        2. "1990 года рождения"
+        3. "1990 г. р." или "1990 г.р."
+        4. "Родился 12 июня 1990 года" или "Родилась 12.06.1990"
+        """
         if not text: 
             return ''
         
-        text = re.sub(r'\s+', ' ', text.strip())
-        text_lower = text.lower()
+        # Берем только первые 300 символов, так как дата рождения всегда в начале
+        text_beginning = text[:300].strip()
+        text_beginning = re.sub(r'\s+', ' ', text_beginning)
+        text_lower = text_beginning.lower()
         
-        # 1. Сначала ищем полную дату рождения
-        # "25 сентября 1963 года рождения"
-        full_date_pattern = r'(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года\s+рождения'
-        full_match = re.search(full_date_pattern, text_lower)
-        if full_match:
-            day, month_str, year = full_match.groups()
+        # 1. ПОЛНАЯ ДАТА С МЕСЯЦЕМ: "12 июня 1990 года рождения"
+        full_date_with_month = r'(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года\s+рождения'
+        match = re.search(full_date_with_month, text_lower)
+        if match:
+            day, month_str, year = match.groups()
             month = self.month_map.get(month_str)
             if month and self._is_valid_birth_year(year):
                 return f"{int(day):02d}.{month}.{year}"
         
-        # 2. Ищем год с явными маркерами рождения в начале текста
-        first_200 = text_lower[:200]
+        # 2. ПОЛНАЯ ДАТА В ФОРМАТЕ DD.MM.YYYY: "12.07.1990 года рождения"
+        full_date_dd_mm_yyyy = r'(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})\s+года\s+рождения'
+        match = re.search(full_date_dd_mm_yyyy, text_lower)
+        if match:
+            day, month, year = match.groups()
+            if self._is_valid_birth_year(year):
+                return f"{int(day):02d}.{int(month):02d}.{year}"
         
-        birth_year_patterns = [
-            # "1967 года рождения,"
-            r'(\d{4})\s+года\s+рождения[,\s]',
-            # "1990 г.р."
-            r'(\d{4})\s*г\.\s*р\.[,\s]',
-            # "1990 г. р."
-            r'(\d{4})\s*г\.\s*р\.[,\s]',
-            # "родился в 1990 году"
-            r'родился?\s+(?:в\s+)?(\d{4})\s+году',
-            # "год рождения: 1990"
-            r'год\s+рождения[:\s]+(\d{4})',
-            # "род. 1990"
-            r'род\.\s*(\d{4})',
-            # "1990 года,"
-            r'(\d{4})\s+года,',
-            # "1990 г.,"
-            r'(\d{4})\s+г\.,',
+        # 3. ТОЛЬКО ГОД: "1990 года рождения"
+        year_only = r'(\d{4})\s+года\s+рождения'
+        match = re.search(year_only, text_lower)
+        if match:
+            year = match.group(1)
+            if self._is_valid_birth_year(year):
+                return year
+        
+        # 4. ГОД С СОКРАЩЕНИЕМ: "1990 г.р." или "1990 г. р."
+        year_gr = r'(\d{4})\s*г\.\s*р\.'
+        match = re.search(year_gr, text_lower)
+        if match:
+            year = match.group(1)
+            if self._is_valid_birth_year(year):
+                return year
+        
+        # 5. "РОДИЛСЯ": "Родился 12 июня 1990 года" или "Родилась 12.06.1990"
+        born_patterns = [
+            # Родился с месяцем: "родился 12 июня 1990 года"
+            r'родился?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года',
+            # Родился с цифровой датой: "родился 12.06.1990"
+            r'родился?\s+(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})',
+            # Родился только с годом: "родился в 1990 году"
+            r'родился?\s+в\s+(\d{4})\s+году',
         ]
         
-        for pattern in birth_year_patterns:
-            match = re.search(pattern, first_200)
+        for pattern in born_patterns:
+            match = re.search(pattern, text_lower)
             if match:
-                year = match.group(1)
-                if self._is_valid_birth_year(year):
-                    return year
-        
-        # 3. Ищем год рождения в контексте "рождения" во всем тексте
-        birth_context_patterns = [
-            r'(\d{4})\s+год[а]?\s+рождения',
-            r'\((\d{4})\s+г\.\s*р\.\)',
-            r'\((\d{4})\s+года\s+рождения\)',
-        ]
-        
-        for pattern in birth_context_patterns:
-            matches = list(re.finditer(pattern, text_lower))
-            for match in matches:
-                year = match.group(1)
-                if self._is_valid_birth_year(year):
-                    # Проверяем контекст - не должен быть годом окончания учебы
-                    context_start = max(0, match.start() - 30)
-                    context_end = min(len(text_lower), match.end() + 30)
-                    context = text_lower[context_start:context_end]
-                    
-                    # Исключаем годы окончания учебы
-                    if not any(word in context for word in ['окончил', 'окончила', 'закончил', 'закончила', 'университет', 'институт', 'академия']):
+                if len(match.groups()) == 3:
+                    # С днем и месяцем
+                    if pattern == born_patterns[0]:  # с месяцем словами
+                        day, month_str, year = match.groups()
+                        month = self.month_map.get(month_str)
+                        if month and self._is_valid_birth_year(year):
+                            return f"{int(day):02d}.{month}.{year}"
+                    else:  # с цифровой датой
+                        day, month, year = match.groups()
+                        if self._is_valid_birth_year(year):
+                            return f"{int(day):02d}.{int(month):02d}.{year}"
+                else:  # только год
+                    year = match.group(1)
+                    if self._is_valid_birth_year(year):
                         return year
         
-        # 4. Ищем год в начале текста, который может быть годом рождения
-        # Проверяем первый год в тексте, если он в первых 100 символах
-        year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', text_lower[:150])
-        if year_match:
-            year = year_match.group(1)
+        # 6. "РОД.": "род. 1990"
+        rod_pattern = r'род\.\s*(\d{4})'
+        match = re.search(rod_pattern, text_lower)
+        if match:
+            year = match.group(1)
             if self._is_valid_birth_year(year):
-                # Проверяем контекст
-                context_start = max(0, year_match.start() - 20)
-                context_end = min(len(text_lower), year_match.end() + 20)
-                context = text_lower[context_start:context_end]
-                
-                # Проверяем, что это не год окончания учебы или другого события
-                is_likely_birth_year = (
-                    any(word in context for word in ['рождения', 'года', 'г.', 'род.']) and
-                    not any(word in context for word in ['окончил', 'окончила', 'закончил', 'закончила', 'поступил', 'поступила'])
-                )
-                
-                if is_likely_birth_year:
-                    return year
+                return year
         
+        # Если ничего не нашли - возвращаем пустую строку
         return ''
 
     async def parse_judge_profile(self, url: str, status: str, region: str, court_type: str, court_name: str) -> Optional[Dict]:
-        """Парсинг профиля судьи с улучшенным извлечением информации"""
+        """Парсинг профиля судьи"""
         try:
             html = await self.fetch_with_retry(url, max_retries=3)
             if not html: 
@@ -382,7 +390,6 @@ class JudgeParser:
                 'court': court_name, 
                 'full_name': '', 
                 'status': status, 
-                'position': '', 
                 'date_of_birth': '', 
                 'judge_info': '', 
                 'profile_url': url
@@ -409,51 +416,26 @@ class JudgeParser:
                 # Объединяем всю информацию
                 data['judge_info'] = '\n'.join(all_info_parts)
                 bio_text = data['judge_info']
-                
-                # Извлечение должности
-                position_found = False
-                for text in all_info_parts:
-                    text_lower = text.lower()
-                    if text_lower.startswith('должность:'):
-                        data['position'] = text.split(':', 1)[1].strip()
-                        position_found = True
-                        break
-                
-                # Если не нашли через "должность:", ищем другие указания
-                if not position_found:
-                    for text in all_info_parts:
-                        text_lower = text.lower()
-                        if any(pos in text_lower for pos in ['председатель', 'судья', 'заместитель']):
-                            # Проверяем, что это описание должности
-                            words = text_lower.split()
-                            if any(pos_word in words[:3] for pos_word in ['председатель', 'судья', 'замествитель']):
-                                data['position'] = text
-                                break
             else:
                 # Если нет вкладки #type-2, пробуем найти информацию в других местах
-                # Ищем блок с информацией о судье
                 sudya_info = content_div.find('div', id='sudya_info')
                 if sudya_info:
                     info_text = sudya_info.get_text(strip=True)
                     data['judge_info'] = info_text
                     bio_text = info_text
             
-            # Извлечение даты рождения
+            # Извлечение даты рождения - ТОЛЬКО из первых 300 символов judge_info
             if bio_text:
                 data['date_of_birth'] = self._extract_date_of_birth(bio_text)
             
-            # Дополнительная проверка: если не нашли дату, пробуем поискать во всем контенте
+            # Если не нашли в judge_info, пробуем поискать в начале всего контента
             if not data['date_of_birth']:
                 full_content_text = content_div.get_text()
-                data['date_of_birth'] = self._extract_date_of_birth(full_content_text[:500])  # Только первые 500 симв
+                data['date_of_birth'] = self._extract_date_of_birth(full_content_text[:300])
             
             # Очистка данных
             if data['date_of_birth']:
-                # Удаляем нежелательные символы
                 data['date_of_birth'] = data['date_of_birth'].strip().replace('\n', '').replace('\r', '')
-            
-            if data['position']:
-                data['position'] = data['position'].strip().replace('\n', ' ')
             
             self.stats['successfully_parsed'] += 1
             return data
@@ -476,10 +458,10 @@ class JudgeParser:
         
         if self.stats['failed_urls']:
             logger.info(f"Проблемные URL: {len(self.stats['failed_urls'])}")
-            with open('failed_urls.txt', 'w', encoding='utf-8') as f:
+            with open(f'failed_urls_{self.region_start}_{self.region_end or "end"}.txt', 'w', encoding='utf-8') as f:
                 for url in self.stats['failed_urls']:
                     f.write(f"{url}\n")
-            logger.info("Список проблемных URL сохранен в failed_urls.txt")
+            logger.info(f"Список проблемных URL сохранен в failed_urls_{self.region_start}_{self.region_end or 'end'}.txt")
         logger.info("="*50)
 
 async def process_in_batches(tasks, batch_size=50):
@@ -501,18 +483,27 @@ async def process_in_batches(tasks, batch_size=50):
     return results
 
 async def main():
-    logger.info("=== Запуск улучшенного парсера судей ===")
+    # Парсинг аргументов командной строки
+    parser = argparse.ArgumentParser(description='Парсер судей')
+    parser.add_argument('--start', type=int, default=1, help='Начальный регион (по умолчанию: 1)')
+    parser.add_argument('--end', type=int, default=1, help='Конечный регион (по умолчанию: все)')
+    parser.add_argument('--tasks', type=int, default=15, help='Количество одновременных задач (по умолчанию: 15)')
     
-    # Настройки
-    MAX_REGIONS = 1  # 1 для теста, None для всех
-    MAX_CONCURRENT_TASKS = 15
+    args = parser.parse_args()
+    
+    logger.info("="*60)
+    logger.info(f"=== Запуск парсера судей ===")
+    logger.info(f"=== Диапазон регионов: с {args.start} по {args.end or 'все'} ===")
+    logger.info(f"=== Макс. одновременных задач: {args.tasks} ===")
+    logger.info("="*60)
     
     all_judges_data = []
     success_flag = False
     
     async with JudgeParser(
-        max_regions=MAX_REGIONS,
-        max_concurrent_tasks=MAX_CONCURRENT_TASKS
+        region_start=args.start,
+        region_end=args.end,
+        max_concurrent_tasks=args.tasks
     ) as parser:
         
         try:
@@ -559,6 +550,7 @@ async def main():
             logger.info("\n" + "="*25 + " СОХРАНЕНИЕ " + "="*25)
             
             if all_judges_data:
+                # Дедупликация по URL
                 unique_judges = {}
                 for judge in all_judges_data:
                     if judge and 'profile_url' in judge:
@@ -566,9 +558,10 @@ async def main():
                 
                 df = pd.DataFrame(list(unique_judges.values()))
                 
+                # Новый порядок столбцов - БЕЗ должности
                 column_order = [
                     'region', 'court_type', 'court', 'full_name', 
-                    'status', 'position', 'date_of_birth', 'judge_info', 'profile_url'
+                    'status', 'date_of_birth', 'judge_info', 'profile_url'
                 ]
                 
                 existing_columns = [col for col in column_order if col in df.columns]
@@ -580,7 +573,6 @@ async def main():
                     'court': 'Название суда',
                     'full_name': 'ФИО Судьи',
                     'status': 'Статус',
-                    'position': 'Должность',
                     'date_of_birth': 'Дата рождения',
                     'judge_info': 'Информация о судье (Био)',
                     'profile_url': 'Ссылка'
@@ -588,14 +580,16 @@ async def main():
                 
                 df.rename(columns=rename_map, inplace=True)
                 
+                # Имя файла с указанием диапазона регионов
                 timestamp = time.strftime('%Y%m%d_%H%M%S')
-                output_file = f"judges_data_{timestamp}.xlsx"
+                region_range = f"regions_{args.start}_{args.end or 'all'}"
+                output_file = f"judges_data_{region_range}_{timestamp}.xlsx"
                 df.to_excel(output_file, index=False, engine='openpyxl')
                 
                 logger.info(f"✓ Данные сохранены в файл: {output_file}")
                 logger.info(f"✓ Всего записей: {len(df)}")
                 
-                csv_file = f"judges_data_{timestamp}.csv"
+                csv_file = f"judges_data_{region_range}_{timestamp}.csv"
                 df.to_csv(csv_file, index=False, encoding='utf-8-sig')
                 logger.info(f"✓ Резервная копия в CSV: {csv_file}")
                 
@@ -622,15 +616,20 @@ async def main():
                         df = pd.DataFrame(list(unique_judges.values()))
                         
                         rename_map = {
-                            'region': 'Регион', 'court_type': 'Тип суда', 'court': 'Название суда',
-                            'full_name': 'ФИО Судьи', 'status': 'Статус', 'position': 'Должность',
-                            'date_of_birth': 'Дата рождения', 'judge_info': 'Информация о судье (Био)',
+                            'region': 'Регион', 
+                            'court_type': 'Тип суда', 
+                            'court': 'Название суда',
+                            'full_name': 'ФИО Судьи', 
+                            'status': 'Статус',
+                            'date_of_birth': 'Дата рождения', 
+                            'judge_info': 'Информация о судье (Био)',
                             'profile_url': 'Ссылка'
                         }
                         
                         df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
                         
-                        output_file = f"judges_data_PARTIAL_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        region_range = f"regions_{args.start}_{args.end or 'all'}"
+                        output_file = f"judges_data_PARTIAL_{region_range}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
                         df.to_excel(output_file, index=False, engine='openpyxl')
                         logger.info(f"✓ Частичные данные сохранены в {output_file} ({len(df)} записей)")
                 except Exception as e:

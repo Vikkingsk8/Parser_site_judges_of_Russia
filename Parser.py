@@ -403,19 +403,27 @@ class JudgeParser:
             # Извлечение информации из вкладки #type-2
             info_tab = soup.find('div', id='type-2')
             bio_text = ''
-            all_info_parts = []
             
             if info_tab:
-                # Берем весь текст из info_tab, включая все параграфы
-                paragraphs = info_tab.find_all('p')
-                for p in paragraphs:
-                    text = p.get_text(strip=True)
-                    if text and text.lower() != 'регистрация':
-                        all_info_parts.append(text)
+                # Находим заголовок "Информация о судье"
+                info_header = info_tab.find('h1', id='comt')
                 
-                # Объединяем всю информацию
-                data['judge_info'] = '\n'.join(all_info_parts)
-                bio_text = data['judge_info']
+                # Находим все параграфы после заголовка
+                paragraphs = info_tab.find_all('p')
+                
+                # Собираем текст из всех параграфов, объединяя их с правильными разделителями
+                all_text_parts = []
+                for p in paragraphs:
+                    text = p.get_text(strip=False)  # strip=False чтобы сохранить пробелы
+                    if text:
+                        # Заменяем множественные пробелы на один
+                        text = re.sub(r'\s+', ' ', text)
+                        all_text_parts.append(text)
+                
+                # Объединяем параграфы с переносом строки
+                if all_text_parts:
+                    data['judge_info'] = '\n'.join(all_text_parts)
+                    bio_text = data['judge_info']
             else:
                 # Если нет вкладки #type-2, пробуем найти информацию в других местах
                 sudya_info = content_div.find('div', id='sudya_info')
@@ -424,7 +432,7 @@ class JudgeParser:
                     data['judge_info'] = info_text
                     bio_text = info_text
             
-            # Извлечение даты рождения - ТОЛЬКО из первых 300 символов judge_info
+            # Извлечение даты рождения
             if bio_text:
                 data['date_of_birth'] = self._extract_date_of_birth(bio_text)
             
@@ -486,7 +494,7 @@ async def main():
     # Парсинг аргументов командной строки
     parser = argparse.ArgumentParser(description='Парсер судей')
     parser.add_argument('--start', type=int, default=1, help='Начальный регион (по умолчанию: 1)')
-    parser.add_argument('--end', type=int, default=1, help='Конечный регион (по умолчанию: все)')
+    parser.add_argument('--end', type=int, default=None, help='Конечный регион (по умолчанию: все)')
     parser.add_argument('--tasks', type=int, default=15, help='Количество одновременных задач (по умолчанию: 15)')
     
     args = parser.parse_args()
@@ -561,7 +569,7 @@ async def main():
                 # Новый порядок столбцов - БЕЗ должности
                 column_order = [
                     'region', 'court_type', 'court', 'full_name', 
-                    'status', 'date_of_birth', 'judge_info', 'profile_url'
+                    'date_of_birth', 'status', 'judge_info', 'profile_url'
                 ]
                 
                 existing_columns = [col for col in column_order if col in df.columns]

@@ -225,40 +225,68 @@ class FailedUrlsParser:
         return ''
 
     def _parse_breadcrumbs(self, soup: BeautifulSoup) -> Dict[str, str]:
-        """Парсинг хлебных крошек для получения типа суда, региона и названия суда"""
+        """Парсинг хлебных крошек для получения типа суда, региона, названия суда и его URL"""
         result = {
             'region': '',
             'court_type': '',
-            'court': ''
+            'court': '',
+            'court_url': ''
         }
         
         breadcrumbs_div = soup.find('div', class_='breadcrumbs')
         if breadcrumbs_div:
-            # Находим все ссылки в хлебных крошках
             links = breadcrumbs_div.find_all('a')
             
-            # По структуре: 
-            # [0] Тип суда (не нужно) 
-            # [1] Региональные суды / Мировые судьи / и т.д. (тип суда)
-            # [2] Оренбургская область / Москва / и т.д. (регион)
-            # [3] Название суда (название суда)
+            # Последняя ссылка ведёт на страницу суда
+            if links:
+                court_link = links[-1]
+                result['court'] = court_link.get_text(strip=True)
+                href = court_link.get('href')
+                if href:
+                    result['court_url'] = urljoin(self.base_url, href)
             
+            # Тип суда — предпоследняя ссылка
             if len(links) >= 2:
-                # Тип суда - это вторая ссылка (индекс 1)
-                result['court_type'] = links[1].get_text(strip=True)
-                logger.debug(f"Найден тип суда: {result['court_type']}")
+                result['court_type'] = links[-2].get_text(strip=True)
             
+            # Регион — пред-предпоследняя
             if len(links) >= 3:
-                # Регион - это третья ссылка (индекс 2)
-                result['region'] = links[2].get_text(strip=True)
-                logger.debug(f"Найден регион: {result['region']}")
-            
-            if len(links) >= 4:
-                # Название суда - это четвертая ссылка (индекс 3)
-                result['court'] = links[3].get_text(strip=True)
-                logger.debug(f"Найден суд: {result['court']}")
+                result['region'] = links[-3].get_text(strip=True)
         
         return result
+
+    async def _get_judge_status_from_court_page(self, court_url: str, judge_url: str) -> Optional[str]:
+        """
+        Загружает страницу суда и определяет статус судьи по блоку, в котором находится ссылка.
+        Возвращает 'Действующий', 'В отставке' или None, если не найдено.
+        """
+        html = await self.fetch_with_retry(court_url, max_retries=2)
+        if not html:
+            return None
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Проверяем блок действующих судей
+        container = soup.find('div', id='sudiilistview')
+        if container:
+            items_div = container.find('div', class_='items')
+            if items_div:
+                for a in items_div.find_all('a', class_='browser_link', href=True):
+                    full_url = urljoin(self.base_url, a['href'])
+                    if full_url == judge_url:
+                        return 'Действующий'
+        
+        # Проверяем блок судей в отставке
+        container = soup.find('div', id='sudiilistview2')
+        if container:
+            items_div = container.find('div', class_='items')
+            if items_div:
+                for a in items_div.find_all('a', class_='browser_link', href=True):
+                    full_url = urljoin(self.base_url, a['href'])
+                    if full_url == judge_url:
+                        return 'В отставке'
+        
+        return None
 
     async def parse_judge_profile(self, url: str) -> Optional[Dict]:
         """Парсинг профиля судьи из failed_urls"""
@@ -274,7 +302,7 @@ class FailedUrlsParser:
                 self.stats['failed_parsed'] += 1
                 return None
 
-            # Парсим хлебные крошки для получения региона, типа суда и названия суда
+            # Парсим хлебные крошки (теперь с URL суда)
             breadcrumbs_data = self._parse_breadcrumbs(soup)
 
             data = {
@@ -282,7 +310,7 @@ class FailedUrlsParser:
                 'court_type': breadcrumbs_data['court_type'],
                 'court': breadcrumbs_data['court'],
                 'full_name': '',
-                'status': 'Действующий',  # По умолчанию, так как статус не указан на странице
+                'status': '',  # будет заполнено
                 'date_of_birth': '',
                 'judge_info': '',
                 'profile_url': url
@@ -295,8 +323,6 @@ class FailedUrlsParser:
 
             # Извлечение информации из вкладки #type-2
             info_tab = soup.find('div', id='type-2')
-            bio_text = ''
-
             if info_tab:
                 paragraphs = info_tab.find_all('p')
                 all_text_parts = []
@@ -307,25 +333,33 @@ class FailedUrlsParser:
                         all_text_parts.append(text)
                 if all_text_parts:
                     data['judge_info'] = '\n'.join(all_text_parts)
-                    bio_text = data['judge_info']
             else:
-                # Если нет вкладки #type-2, пробуем найти информацию в других местах
                 sudya_info = content_div.find('div', id='sudya_info')
                 if sudya_info:
-                    info_text = sudya_info.get_text(strip=True)
-                    data['judge_info'] = info_text
-                    bio_text = info_text
+                    data['judge_info'] = sudya_info.get_text(strip=True)
 
             # Извлечение даты рождения
-            if bio_text:
-                data['date_of_birth'] = self._extract_date_of_birth(bio_text)
-
-            # Если не нашли в judge_info, пробуем поискать в начале всего контента
+            if data['judge_info']:
+                data['date_of_birth'] = self._extract_date_of_birth(data['judge_info'])
             if not data['date_of_birth']:
                 full_content_text = content_div.get_text()
                 data['date_of_birth'] = self._extract_date_of_birth(full_content_text[:300])
 
-            # Очистка данных от недопустимых символов
+            # ОПРЕДЕЛЕНИЕ СТАТУСА через страницу суда
+            if breadcrumbs_data['court_url']:
+                status_from_court = await self._get_judge_status_from_court_page(
+                    breadcrumbs_data['court_url'], url
+                )
+                if status_from_court:
+                    data['status'] = status_from_court
+                else:
+                    # Если не нашли на странице суда, оставляем пустым или ставим 'Действующий' по умолчанию
+                    data['status'] = 'Действующий'
+            else:
+                # Нет URL суда — ставим по умолчанию
+                data['status'] = 'Действующий'
+
+            # Очистка данных
             for key in data:
                 if data[key] and isinstance(data[key], str):
                     data[key] = self._clean_text_for_excel(data[key])
@@ -463,7 +497,7 @@ async def main():
     # Можно указать другие имена файлов при необходимости
     await parser.run(
         failed_urls_file='failed_urls_16_56.txt', 
-        output_file='parsed_failed_judges.xlsx'
+        output_file='parsed_failed_judges1.xlsx'
     )
 
 if __name__ == '__main__':

@@ -25,7 +25,7 @@ class JudgeParser:
     def __init__(
         self, 
         region_start: int = 1,
-        region_end: Optional[int] = None,
+        region_end: Optional[int] = 45,
         max_court_types_per_region=None, 
         max_courts_per_type=None, 
         max_judges_per_court=None,
@@ -150,6 +150,24 @@ class JudgeParser:
                 
         return None
 
+    def _clean_text_for_excel(self, text: str) -> str:
+        """Очищает текст от символов, недопустимых в Excel"""
+        if not isinstance(text, str):
+            return text
+        
+        # Удаляем управляющие символы (кроме переноса строки и табуляции)
+        # Диапазоны управляющих символов: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F-0x9F
+        cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
+        
+        # Заменяем неразрывные пробелы на обычные
+        cleaned = cleaned.replace('\xa0', ' ')
+        cleaned = cleaned.replace('&nbsp;', ' ')
+        
+        # Удаляем множественные пробелы
+        cleaned = re.sub(r' +', ' ', cleaned)
+        
+        return cleaned.strip()
+
     async def get_region_urls(self) -> List[Tuple[str, str]]:
         url = urljoin(self.base_url, "suds/index")
         html = await self.fetch_with_retry(url, max_retries=3)
@@ -196,25 +214,60 @@ class JudgeParser:
             return court_types[:self.max_court_types_per_region]
         return court_types
 
-    async def get_courts_from_type_page(self, type_url: str) -> List[Tuple[str, str]]:
+    async def get_courts_from_type_page(self, type_url: str, visited_type_pages: Set[str] = None) -> List[Tuple[str, str]]:
+        """Получение списка судов для типа суда с поддержкой пагинации"""
+        if visited_type_pages is None:
+            visited_type_pages = set()
+        
+        # Проверяем полный URL (включая параметры пагинации)
+        if type_url in visited_type_pages:
+            logger.debug(f"URL уже посещен: {type_url}")
+            return []
+        
+        visited_type_pages.add(type_url)
+        
+        logger.debug(f"Загрузка страницы судов: {type_url}")
         html = await self.fetch_with_retry(type_url)
         if not html: 
             return []
             
         soup = BeautifulSoup(html, 'html.parser')
         courts = []
-        items_div = soup.find('div', class_='items')
         
-        if items_div:
-            for div in items_div.find_all('div', class_='browser_view_suds'):
-                a_tag = div.find('a', class_='browser_link')
+        # Ищем блок с судами - используем id='sudiilistview' как в HTML
+        list_view = soup.find('div', id='sudiilistview')
+        if list_view:
+            items_div = list_view.find('div', class_='items')
+            if items_div:
+                for div in items_div.find_all('div', class_='browser_view_suds'):
+                    a_tag = div.find('a', class_='browser_link')
+                    if a_tag:
+                        court_name = a_tag.get_text(strip=True)
+                        court_url = urljoin(self.base_url, a_tag['href'])
+                        courts.append((court_name, court_url))
+                        logger.debug(f"Найден суд: {court_name}")
+        
+        logger.info(f"На странице {type_url} найдено {len(courts)} судов")
+        
+        # Обработка пагинации
+        pager = soup.find('div', class_='pager')
+        if pager:
+            # Ищем только ссылку "Следующая >"
+            next_link = pager.find('li', class_='next')
+            if next_link:
+                a_tag = next_link.find('a', href=True)
                 if a_tag:
-                    court_name = a_tag.get_text(strip=True)
-                    court_url = urljoin(self.base_url, a_tag['href'])
-                    courts.append((court_name, court_url))
+                    next_page_url = urljoin(type_url, a_tag['href'])
+                    
+                    # Проверяем, не посещали ли мы эту страницу
+                    if next_page_url not in visited_type_pages:
+                        logger.info(f"Переход на следующую страницу: {next_page_url}")
+                        # Рекурсивно загружаем следующую страницу
+                        next_courts = await self.get_courts_from_type_page(next_page_url, visited_type_pages)
+                        courts.extend(next_courts)
+                    else:
+                        logger.debug(f"Следующая страница уже посещена: {next_page_url}")
         
-        if self.max_courts_per_type: 
-            return courts[:self.max_courts_per_type]
         return courts
 
     async def get_all_judges_from_court(self, court_url: str, visited_urls: Set[str]) -> List[Tuple[str, str]]:
@@ -331,13 +384,20 @@ class JudgeParser:
                 return year
         
         # 5. "РОДИЛСЯ": "Родился 12 июня 1990 года" или "Родилась 12.06.1990"
+        # 5. "РОДИЛСЯ/РОДИЛАСЬ": разные варианты
         born_patterns = [
-            # Родился с месяцем: "родился 12 июня 1990 года"
-            r'родился?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года',
-            # Родился с цифровой датой: "родился 12.06.1990"
-            r'родился?\s+(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})',
-            # Родился только с годом: "родился в 1990 году"
-            r'родился?\s+в\s+(\d{4})\s+году',
+            # Родился/родилась с полной датой: "родился 12 июня 1990 года", "родилась 28 мая 1982 года"
+            r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года',
+            # Родился/родилась с полной датой: "родился 12 июня 1990 г.", "родилась 28 мая 1982 г."
+            r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+г\.',
+            # Родился/родилась с цифровой датой: "родился 12.06.1990", "родилась 28.05.1982"
+            r'родил[ая]сь?\s+(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})',
+            # Родился/родилась только с годом: "родился в 1990 году", "родилась в 1982 году"
+            r'родил[ая]сь?\s+в\s+(\d{4})\s+году',
+            # Родился/родилась только с годом: "родился в 1986 г.", "родилась в 1982 г."
+            r'родил[ая]сь?\s+в\s+(\d{4})\s+г\.',
+            # Родился/родилась только с годом: "родился в 1986", "родилась в 1982"
+            r'родил[ая]сь?\s+в\s+(\d{4})(?:\s|$|\.)',
         ]
         
         for pattern in born_patterns:
@@ -405,16 +465,13 @@ class JudgeParser:
             bio_text = ''
             
             if info_tab:
-                # Находим заголовок "Информация о судье"
-                info_header = info_tab.find('h1', id='comt')
-                
-                # Находим все параграфы после заголовка
+                # Находим все параграфы
                 paragraphs = info_tab.find_all('p')
                 
-                # Собираем текст из всех параграфов, объединяя их с правильными разделителями
+                # Собираем текст из всех параграфов
                 all_text_parts = []
                 for p in paragraphs:
-                    text = p.get_text(strip=False)  # strip=False чтобы сохранить пробелы
+                    text = p.get_text(strip=False)
                     if text:
                         # Заменяем множественные пробелы на один
                         text = re.sub(r'\s+', ' ', text)
@@ -441,9 +498,21 @@ class JudgeParser:
                 full_content_text = content_div.get_text()
                 data['date_of_birth'] = self._extract_date_of_birth(full_content_text[:300])
             
-            # Очистка данных
+            # Очистка данных от недопустимых символов
             if data['date_of_birth']:
-                data['date_of_birth'] = data['date_of_birth'].strip().replace('\n', '').replace('\r', '')
+                data['date_of_birth'] = self._clean_text_for_excel(data['date_of_birth'])
+            if data['judge_info']:
+                data['judge_info'] = self._clean_text_for_excel(data['judge_info'])
+            if data['full_name']:
+                data['full_name'] = self._clean_text_for_excel(data['full_name'])
+            if data['region']:
+                data['region'] = self._clean_text_for_excel(data['region'])
+            if data['court_type']:
+                data['court_type'] = self._clean_text_for_excel(data['court_type'])
+            if data['court']:
+                data['court'] = self._clean_text_for_excel(data['court'])
+            if data['status']:
+                data['status'] = self._clean_text_for_excel(data['status'])
             
             self.stats['successfully_parsed'] += 1
             return data
@@ -493,8 +562,8 @@ async def process_in_batches(tasks, batch_size=50):
 async def main():
     # Парсинг аргументов командной строки
     parser = argparse.ArgumentParser(description='Парсер судей')
-    parser.add_argument('--start', type=int, default=1, help='Начальный регион (по умолчанию: 1)')
-    parser.add_argument('--end', type=int, default=None, help='Конечный регион (по умолчанию: все)')
+    parser.add_argument('--start', type=int, default=28, help='Начальный регион (по умолчанию: 1)')
+    parser.add_argument('--end', type=int, default=28, help='Конечный регион (по умолчанию: 45)')
     parser.add_argument('--tasks', type=int, default=15, help='Количество одновременных задач (по умолчанию: 15)')
     
     args = parser.parse_args()
@@ -527,7 +596,7 @@ async def main():
                 court_types = await parser.get_court_types_from_region(region_url)
                 
                 for court_type_name, type_url in court_types:
-                    courts = await parser.get_courts_from_type_page(type_url)
+                    courts = await parser.get_courts_from_type_page(type_url, set()) 
                     
                     for court_name, court_url in courts:
                         visited_pages_for_court = set()
@@ -566,7 +635,8 @@ async def main():
                 
                 df = pd.DataFrame(list(unique_judges.values()))
                 
-                # Новый порядок столбцов - БЕЗ должности
+                # Новый порядок столбцов: Регион, Тип суда, Название суда, ФИО судьи, 
+                # Дата рождения, Статус, Информация о судье, Ссылка
                 column_order = [
                     'region', 'court_type', 'court', 'full_name', 
                     'date_of_birth', 'status', 'judge_info', 'profile_url'
@@ -580,8 +650,8 @@ async def main():
                     'court_type': 'Тип суда',
                     'court': 'Название суда',
                     'full_name': 'ФИО Судьи',
-                    'status': 'Статус',
                     'date_of_birth': 'Дата рождения',
+                    'status': 'Статус',
                     'judge_info': 'Информация о судье (Био)',
                     'profile_url': 'Ссылка'
                 }
@@ -592,11 +662,21 @@ async def main():
                 timestamp = time.strftime('%Y%m%d_%H%M%S')
                 region_range = f"regions_{args.start}_{args.end or 'all'}"
                 output_file = f"judges_data_{region_range}_{timestamp}.xlsx"
-                df.to_excel(output_file, index=False, engine='openpyxl')
                 
-                logger.info(f"✓ Данные сохранены в файл: {output_file}")
+                # Пробуем сохранить в Excel, если ошибка - сохраняем в CSV
+                try:
+                    df.to_excel(output_file, index=False, engine='openpyxl')
+                    logger.info(f"✓ Данные сохранены в файл: {output_file}")
+                except Exception as e:
+                    logger.error(f"Ошибка при сохранении в Excel: {e}")
+                    logger.info("Пробуем сохранить в CSV...")
+                    csv_file = f"judges_data_{region_range}_{timestamp}.csv"
+                    df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+                    logger.info(f"✓ Данные сохранены в CSV: {csv_file}")
+                
                 logger.info(f"✓ Всего записей: {len(df)}")
                 
+                # Дополнительное сохранение в CSV как резервная копия
                 csv_file = f"judges_data_{region_range}_{timestamp}.csv"
                 df.to_csv(csv_file, index=False, encoding='utf-8-sig')
                 logger.info(f"✓ Резервная копия в CSV: {csv_file}")
@@ -628,8 +708,8 @@ async def main():
                             'court_type': 'Тип суда', 
                             'court': 'Название суда',
                             'full_name': 'ФИО Судьи', 
+                            'date_of_birth': 'Дата рождения',
                             'status': 'Статус',
-                            'date_of_birth': 'Дата рождения', 
                             'judge_info': 'Информация о судье (Био)',
                             'profile_url': 'Ссылка'
                         }
@@ -637,9 +717,9 @@ async def main():
                         df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
                         
                         region_range = f"regions_{args.start}_{args.end or 'all'}"
-                        output_file = f"judges_data_PARTIAL_{region_range}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-                        df.to_excel(output_file, index=False, engine='openpyxl')
-                        logger.info(f"✓ Частичные данные сохранены в {output_file} ({len(df)} записей)")
+                        csv_file = f"judges_data_PARTIAL_{region_range}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+                        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+                        logger.info(f"✓ Частичные данные сохранены в {csv_file} ({len(df)} записей)")
                 except Exception as e:
                     logger.error(f"Ошибка при сохранении частичных данных: {e}")
 

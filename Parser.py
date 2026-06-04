@@ -387,34 +387,32 @@ class JudgeParser:
         # 5. "РОДИЛСЯ/РОДИЛАСЬ": разные варианты
         born_patterns = [
             # Родился/родилась с полной датой: "родился 12 июня 1990 года", "родилась 28 мая 1982 года"
-            r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года',
+            (r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+года', 'month'),
             # Родился/родилась с полной датой: "родился 12 июня 1990 г.", "родилась 28 мая 1982 г."
-            r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+г\.',
+            (r'родил[ая]сь?\s+(\d{1,2})\s+([а-я]+)\s+(\d{4})\s+г\.', 'month'),
             # Родился/родилась с цифровой датой: "родился 12.06.1990", "родилась 28.05.1982"
-            r'родил[ая]сь?\s+(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})',
+            (r'родил[ая]сь?\s+(\d{1,2})[\.\-](\d{1,2})[\.\-](\d{4})', 'date'),
             # Родился/родилась только с годом: "родился в 1990 году", "родилась в 1982 году"
-            r'родил[ая]сь?\s+в\s+(\d{4})\s+году',
+            (r'родил[ая]сь?\s+в\s+(\d{4})\s+году', 'year'),
             # Родился/родилась только с годом: "родился в 1986 г.", "родилась в 1982 г."
-            r'родил[ая]сь?\s+в\s+(\d{4})\s+г\.',
+            (r'родил[ая]сь?\s+в\s+(\d{4})\s+г\.', 'year'),
             # Родился/родилась только с годом: "родился в 1986", "родилась в 1982"
-            r'родил[ая]сь?\s+в\s+(\d{4})(?:\s|$|\.)',
+            (r'родил[ая]сь?\s+в\s+(\d{4})(?:\s|$|\.)', 'year'),
         ]
         
-        for pattern in born_patterns:
+        for pattern, pattern_type in born_patterns:
             match = re.search(pattern, text_lower)
             if match:
-                if len(match.groups()) == 3:
-                    # С днем и месяцем
-                    if pattern == born_patterns[0]:  # с месяцем словами
-                        day, month_str, year = match.groups()
-                        month = self.month_map.get(month_str)
-                        if month and self._is_valid_birth_year(year):
-                            return f"{int(day):02d}.{month}.{year}"
-                    else:  # с цифровой датой
-                        day, month, year = match.groups()
-                        if self._is_valid_birth_year(year):
-                            return f"{int(day):02d}.{int(month):02d}.{year}"
-                else:  # только год
+                if pattern_type == 'month':
+                    day, month_str, year = match.groups()
+                    month = self.month_map.get(month_str)  # ✅ через словарь!
+                    if month and self._is_valid_birth_year(year):
+                        return f"{int(day):02d}.{month}.{year}"
+                elif pattern_type == 'date':
+                    day, month, year = match.groups()
+                    if self._is_valid_birth_year(year):
+                        return f"{int(day):02d}.{int(month):02d}.{year}"
+                else:  # pattern_type == 'year'
                     year = match.group(1)
                     if self._is_valid_birth_year(year):
                         return year
@@ -562,8 +560,8 @@ async def process_in_batches(tasks, batch_size=50):
 async def main():
     # Парсинг аргументов командной строки
     parser = argparse.ArgumentParser(description='Парсер судей')
-    parser.add_argument('--start', type=int, default=28, help='Начальный регион (по умолчанию: 1)')
-    parser.add_argument('--end', type=int, default=28, help='Конечный регион (по умолчанию: 45)')
+    parser.add_argument('--start', type=int, default=57, help='Начальный регион (по умолчанию: 1)')
+    parser.add_argument('--end', type=int, default=90, help='Конечный регион (по умолчанию: 45)')
     parser.add_argument('--tasks', type=int, default=15, help='Количество одновременных задач (по умолчанию: 15)')
     
     args = parser.parse_args()
